@@ -5,8 +5,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-import io.mosip.commons.packet.constants.Biometric;
-import io.mosip.kernel.biometrics.constant.BiometricType;
 import io.mosip.kernel.biometrics.model.QualityScore;
 import io.mosip.kernel.core.logger.spi.Logger;
 import io.mosip.registration.audit.AuditManagerService;
@@ -28,6 +26,8 @@ import org.springframework.stereotype.Component;
  *
  * <p>Configuration is read from application context at runtime using the
  * {@code RegistrationConstants.QUALITY_*} prefix keys.
+ *
+ * @author Antigravity
  */
 @Component
 public class BiometricQualityOrchestrator {
@@ -46,41 +46,6 @@ public class BiometricQualityOrchestrator {
 	private AuditManagerService auditFactory;
 
 	/**
-	 * Holds the final aggregated score together with the individual per-evaluator
-	 * scores (e.g. "SBI" -> 44.0, "SDK" -> 75.0) that fed into it, so callers can
-	 * display/store the raw sources alongside the aggregate.
-	 */
-	public static class OrchestrationResult {
-		private final double aggregatedScore;
-		private final Map<String, Double> evaluatorScores;
-		private final boolean aggregationExplicitlyConfigured;
-
-		public OrchestrationResult(double aggregatedScore, Map<String, Double> evaluatorScores,
-				boolean aggregationExplicitlyConfigured) {
-			this.aggregatedScore = aggregatedScore;
-			this.evaluatorScores = evaluatorScores;
-			this.aggregationExplicitlyConfigured = aggregationExplicitlyConfigured;
-		}
-
-		public double getAggregatedScore() {
-			return aggregatedScore;
-		}
-
-		/**
-		 * @return true if an aggregation strategy was explicitly set via config
-		 *         (modality/attribute/default key); false if the orchestrator fell
-		 *         back to its built-in MEAN default because nothing was configured.
-		 */
-		public boolean isAggregationExplicitlyConfigured() {
-			return aggregationExplicitlyConfigured;
-		}
-
-		public Map<String, Double> getEvaluatorScores() {
-			return evaluatorScores;
-		}
-	}
-
-	/**
 	 * Orchestrates the quality evaluation for a given biometric DTO.
 	 *
 	 * <p>Steps:
@@ -88,47 +53,23 @@ public class BiometricQualityOrchestrator {
 	 *   <li>Reads which evaluators are configured for the modality/attribute.</li>
 	 *   <li>Runs each evaluator and collects scores.</li>
 	 *   <li>Selects the configured aggregation strategy and aggregates scores.</li>
-	 *   <li>Returns the aggregated score together with the individual evaluator scores.</li>
+	 *   <li>Returns the aggregated score.</li>
 	 * </ol>
 	 *
 	 * @param biometricsDto the captured biometric data
-	 * @return the aggregated final quality score (0-100) plus the raw per-evaluator scores
+	 * @return the aggregated final quality score (0-100)
 	 * @throws RegBaseCheckedException if no evaluators are configured or evaluation fails
 	 */
-	public OrchestrationResult orchestrate(BiometricsDto biometricsDto) throws RegBaseCheckedException {
+	public double orchestrate(BiometricsDto biometricsDto) throws RegBaseCheckedException {
 		String bioAttribute = biometricsDto.getBioAttribute();
 		LOGGER.info("BiometricQualityOrchestrator: Starting quality orchestration for attribute {}", bioAttribute);
 
-		// 1. Resolve modality (FINGER, IRIS, FACE) from bioAttribute for config lookup
-		String modality = resolveModality(bioAttribute);
-
-		
-		String modalityKeyUpper = RegistrationConstants.QUALITY_EVALUATORS_MODALITY_PREFIX + modality.toUpperCase();
-		String modalityKeyLower = RegistrationConstants.QUALITY_EVALUATORS_MODALITY_PREFIX + modality.toLowerCase();
-		String attributeKey     = RegistrationConstants.QUALITY_EVALUATORS_PREFIX + bioAttribute;
-		String defaultKey       = RegistrationConstants.QUALITY_EVALUATORS_PREFIX + "default";
-
-		String evaluatorConfig;
-		if (ApplicationContext.map().containsKey(modalityKeyUpper)) {
-			evaluatorConfig = (String) ApplicationContext.map().get(modalityKeyUpper);
-			LOGGER.info("BiometricQualityOrchestrator: Using modality config '{}' for modality {} (attribute {})",
-					modalityKeyUpper, modality, bioAttribute);
-		} else if (ApplicationContext.map().containsKey(modalityKeyLower)) {
-			evaluatorConfig = (String) ApplicationContext.map().get(modalityKeyLower);
-			LOGGER.info("BiometricQualityOrchestrator: Using modality config '{}' for modality {} (attribute {})",
-					modalityKeyLower, modality, bioAttribute);
-		} else if (ApplicationContext.map().containsKey(attributeKey)) {
-			evaluatorConfig = (String) ApplicationContext.map().get(attributeKey);
-			LOGGER.info("BiometricQualityOrchestrator: Using attribute config '{}' for attribute {}", attributeKey, bioAttribute);
-		} else {
-			evaluatorConfig = (String) ApplicationContext.map().getOrDefault(defaultKey, "SBI");
-			LOGGER.info("BiometricQualityOrchestrator: Using default evaluator config for attribute {}", bioAttribute);
-		}
-
+		// 1. Read the configured evaluator list for this attribute (or global fallback)
+		String evaluatorConfig = (String) ApplicationContext.map()
+				.getOrDefault(RegistrationConstants.QUALITY_EVALUATORS_PREFIX + bioAttribute,
+						ApplicationContext.map().getOrDefault(RegistrationConstants.QUALITY_EVALUATORS_PREFIX + "default", "SBI"));
 		List<String> configuredEvaluatorNames = List.of(evaluatorConfig.split(",")).stream()
 				.map(String::trim).filter(s -> !s.isEmpty()).collect(Collectors.toList());
-
-
 
 		// 2. Collect only the matching evaluators
 		List<IBiometricQualityEvaluator> selectedEvaluators = evaluators.stream()
@@ -138,20 +79,18 @@ public class BiometricQualityOrchestrator {
 
 		if (selectedEvaluators.isEmpty()) {
 			LOGGER.error("BiometricQualityOrchestrator: No matching evaluators found for configured names: {}", configuredEvaluatorNames);
-			safeAudit(AuditEvent.QUALITY_ORCH_FAILED, bioAttribute, "NO_EVALUATOR");
+			auditFactory.audit(AuditEvent.QUALITY_ORCH_FAILED, Components.REG_BIOMETRICS,
+					bioAttribute, "NO_EVALUATOR");
 			throw new RegBaseCheckedException(
 					RegistrationExceptionConstants.REG_NO_QUALITY_SOURCE.getErrorCode(),
 					RegistrationExceptionConstants.REG_NO_QUALITY_SOURCE.getErrorMessage());
 		}
 
-		// 3. Run each evaluator and collect scores.
-		// A configured evaluator that fails (invalid score, timeout, exception) blocks
-		// immediately and does NOT silently fall back to the remaining sources - only
-		// an evaluator that was never configured/selected is skipped silently.
+		// 3. Run each evaluator and collect scores
 		Map<String, Double> scores = new HashMap<>();
 		for (IBiometricQualityEvaluator evaluator : selectedEvaluators) {
-			LOGGER.info("BiometricQualityOrchestrator: Running evaluator {} for attribute {}", evaluator.getEvaluatorName(), bioAttribute);
 			try {
+				LOGGER.info("BiometricQualityOrchestrator: Running evaluator {} for attribute {}", evaluator.getEvaluatorName(), bioAttribute);
 				QualityScore qs = evaluator.evaluate(biometricsDto);
 				if (qs != null) {
 					scores.put(evaluator.getEvaluatorName(), (double) qs.getScore());
@@ -159,50 +98,22 @@ public class BiometricQualityOrchestrator {
 			} catch (RegBaseCheckedException e) {
 				LOGGER.error("BiometricQualityOrchestrator: Evaluator {} failed for attribute {}: {}",
 						evaluator.getEvaluatorName(), bioAttribute, e.getMessage());
-				safeAudit(AuditEvent.QUALITY_ORCH_FAILED, bioAttribute, evaluator.getEvaluatorName() + "_FAILED");
-				throw e;
+				// Continue with other evaluators, not fatal unless all fail
 			}
 		}
 
 		if (scores.isEmpty()) {
 			LOGGER.error("BiometricQualityOrchestrator: All evaluators failed for attribute {}", bioAttribute);
-			safeAudit(AuditEvent.QUALITY_ORCH_FAILED, bioAttribute, "ALL_EVALUATORS_FAILED");
+			auditFactory.audit(AuditEvent.QUALITY_ORCH_FAILED, Components.REG_BIOMETRICS, bioAttribute, "ALL_EVALUATORS_FAILED");
 			throw new RegBaseCheckedException(
 					RegistrationExceptionConstants.REG_NO_QUALITY_SOURCE.getErrorCode(),
 					RegistrationExceptionConstants.REG_NO_QUALITY_SOURCE.getErrorMessage());
 		}
 
-		// 4. Read the configured aggregation strategy (Hierarchy: modality > attribute > default)
-		String aggModalityKeyUpper = RegistrationConstants.QUALITY_AGGREGATION_MODALITY_PREFIX + modality.toUpperCase();
-		String aggModalityKeyLower = RegistrationConstants.QUALITY_AGGREGATION_MODALITY_PREFIX + modality.toLowerCase();
-		String aggAttributeKey     = RegistrationConstants.QUALITY_AGGREGATION_PREFIX + bioAttribute;
-		String aggDefaultKey       = RegistrationConstants.QUALITY_AGGREGATION_PREFIX + "default";
-
-		// Scoped strictly to spring.properties / mosip-application.properties: a DB
-		// global-param or local-preference override does NOT count as "configured"
-		// here, only the build's own config files do.
-		boolean aggregationExplicitlyConfigured = io.mosip.registration.config.DaoConfig.isKeyPresentInPropertiesFile(aggModalityKeyUpper)
-				|| io.mosip.registration.config.DaoConfig.isKeyPresentInPropertiesFile(aggModalityKeyLower)
-				|| io.mosip.registration.config.DaoConfig.isKeyPresentInPropertiesFile(aggAttributeKey)
-				|| io.mosip.registration.config.DaoConfig.isKeyPresentInPropertiesFile(aggDefaultKey);
-
-		// When the strategy is explicitly set in the config files, take the value
-		// straight from the file (not the merged runtime map, which can carry a
-		// stale DB global-param or local-preference override on top of it).
-		String strategyName;
-		if (aggregationExplicitlyConfigured) {
-			if (io.mosip.registration.config.DaoConfig.isKeyPresentInPropertiesFile(aggModalityKeyUpper)) {
-				strategyName = io.mosip.registration.config.DaoConfig.getPropertyValueFromFile(aggModalityKeyUpper);
-			} else if (io.mosip.registration.config.DaoConfig.isKeyPresentInPropertiesFile(aggModalityKeyLower)) {
-				strategyName = io.mosip.registration.config.DaoConfig.getPropertyValueFromFile(aggModalityKeyLower);
-			} else if (io.mosip.registration.config.DaoConfig.isKeyPresentInPropertiesFile(aggAttributeKey)) {
-				strategyName = io.mosip.registration.config.DaoConfig.getPropertyValueFromFile(aggAttributeKey);
-			} else {
-				strategyName = io.mosip.registration.config.DaoConfig.getPropertyValueFromFile(aggDefaultKey);
-			}
-		} else {
-			strategyName = "MEAN";
-		}
+		// 4. Read the configured aggregation strategy
+		String strategyName = (String) ApplicationContext.map()
+				.getOrDefault(RegistrationConstants.QUALITY_AGGREGATION_PREFIX + bioAttribute,
+						ApplicationContext.map().getOrDefault(RegistrationConstants.QUALITY_AGGREGATION_PREFIX + "default", "MEAN"));
 		strategyName = strategyName.trim().toUpperCase();
 
 		// 5. Read per-evaluator weights (for weighted strategies)
@@ -230,88 +141,17 @@ public class BiometricQualityOrchestrator {
 
 		if (selectedAggregator == null) {
 			LOGGER.error("BiometricQualityOrchestrator: No aggregator found for strategy {}", strategyName);
-			safeAudit(AuditEvent.QUALITY_ORCH_FAILED, bioAttribute, "NO_AGGREGATOR");
+			auditFactory.audit(AuditEvent.QUALITY_ORCH_FAILED, Components.REG_BIOMETRICS, bioAttribute, "NO_AGGREGATOR");
 			throw new RegBaseCheckedException(
 					RegistrationExceptionConstants.REG_NO_QUALITY_SOURCE.getErrorCode(),
 					RegistrationExceptionConstants.REG_NO_QUALITY_SOURCE.getErrorMessage());
 		}
 
-		// FormulaScoreAggregator reads its SpEL expression from FormulaContext (a
-		// ThreadLocal), not from a parameter - resolve it here (per-attribute, else
-		// default) before aggregating. Only overwrite FormulaContext when config
-		// actually provides an expression, so a value already set directly by a
-		// caller (e.g. a test driving the aggregator layer) isn't clobbered with
-		// null just because no properties-file formula exists for this attribute.
-		boolean formulaSetHere = false;
-		if ("FORMULA".equalsIgnoreCase(finalStrategyName)) {
-			String formulaAttrKey = RegistrationConstants.QUALITY_FORMULA_PREFIX + bioAttribute;
-			String formulaDefaultKey = RegistrationConstants.QUALITY_FORMULA_PREFIX + "default";
-			String formulaExpr = (String) ApplicationContext.map().get(formulaAttrKey);
-			if (formulaExpr == null) {
-				formulaExpr = (String) ApplicationContext.map().get(formulaDefaultKey);
-			}
-			if (formulaExpr != null) {
-				io.mosip.registration.service.bio.quality.config.FormulaContext.setFormula(formulaExpr);
-				formulaSetHere = true;
-			}
-		}
-
-		double aggregatedScore;
-		try {
-			aggregatedScore = selectedAggregator.aggregate(scores, weights);
-		} finally {
-			if (formulaSetHere) {
-				io.mosip.registration.service.bio.quality.config.FormulaContext.clear();
-			}
-		}
+		double aggregatedScore = selectedAggregator.aggregate(scores, weights);
 		LOGGER.info("BiometricQualityOrchestrator: Aggregated score {} using strategy {} for attribute {}",
 				aggregatedScore, finalStrategyName, bioAttribute);
 
-		safeAudit(AuditEvent.QUALITY_ORCH_COMPLETED, bioAttribute, "ORCH_DONE");
-		return new OrchestrationResult(aggregatedScore, scores, aggregationExplicitlyConfigured);
-	}
-
-	/**
-	 * Records an audit event without letting an audit-subsystem failure disrupt
-	 * quality evaluation itself (Audit Log Failure: continue, log a warning).
-	 */
-	private void safeAudit(AuditEvent event, String bioAttribute, String reason) {
-		try {
-			auditFactory.audit(event, Components.REG_BIOMETRICS, bioAttribute, reason);
-		} catch (Exception e) {
-			LOGGER.warn("Warning: Unable to record biometric quality audit details.", e);
-		}
-	}
-
-	/**
-	 * Resolves the modality name (e.g. FINGER, IRIS, FACE) for a bioAttribute.
-	 *
-	 * @param bioAttribute the attribute name (e.g. leftIndex, leftEye, face)
-	 * @return modality name string or UNKNOWN
-	 */
-	private String resolveModality(String bioAttribute) {
-		if (bioAttribute == null) {
-			return "UNKNOWN";
-		}
-		try {
-			BiometricType type = Biometric.getSingleTypeByAttribute(bioAttribute);
-			if (type != null) {
-				return type.name().toUpperCase();
-			}
-		} catch (Throwable t) {
-			LOGGER.debug("BiometricQualityOrchestrator: Biometric.getSingleTypeByAttribute fallback for {}", bioAttribute);
-		}
-
-		// Fallback string matching for standard MOSIP attributes (e.g. in test environment)
-		String attr = bioAttribute.toLowerCase();
-		if (attr.contains("eye") || attr.contains("iris")) {
-			return "IRIS";
-		} else if (attr.contains("face")) {
-			return "FACE";
-		} else if (attr.contains("index") || attr.contains("thumb") || attr.contains("middle")
-				|| attr.contains("ring") || attr.contains("little") || attr.contains("finger") || attr.contains("hand")) {
-			return "FINGER";
-		}
-		return "UNKNOWN";
+		auditFactory.audit(AuditEvent.QUALITY_ORCH_COMPLETED, Components.REG_BIOMETRICS, bioAttribute, "ORCH_DONE");
+		return aggregatedScore;
 	}
 }

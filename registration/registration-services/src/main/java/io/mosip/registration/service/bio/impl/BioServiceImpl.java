@@ -94,76 +94,29 @@ public class BioServiceImpl extends BaseService implements BioService {
 					continue;
 				}
 
-				// Corrupt Data: the device returned a segment with no readable biometric
-				// payload at all - reject it outright rather than scoring garbage.
-				if (biometricsDto.getAttributeISO() == null || biometricsDto.getAttributeISO().length == 0) {
-					LOGGER.error("BioServiceImpl: Corrupt/unreadable biometric data for attribute {}",
-							biometricsDto.getBioAttribute());
-					throw new RegBaseCheckedException(
-							RegistrationExceptionConstants.REG_CORRUPT_BIOMETRIC_DATA.getErrorCode(),
-							RegistrationExceptionConstants.REG_CORRUPT_BIOMETRIC_DATA.getErrorMessage());
-				}
-
 				if (!ValueRange.of(0, RegistrationConstants.MAX_BIO_QUALITY_SCORE).isValidValue((long) biometricsDto.getQualityScore()))
 					throw new RegBaseCheckedException(RegistrationExceptionConstants.REG_BIOMETRIC_QUALITY_SCORE_RANGE_ERROR.getErrorCode(),
 							RegistrationExceptionConstants.REG_BIOMETRIC_QUALITY_SCORE_RANGE_ERROR.getErrorMessage());
 
 				if (RegistrationConstants.ENABLE.equalsIgnoreCase((String) ApplicationContext.map()
 						.getOrDefault(RegistrationConstants.QUALITY_CHECK_WITH_SDK, RegistrationConstants.DISABLE))) {
-					// Route through the BiometricQualityOrchestrator for multi-source evaluation.
-					// A configured source (SDK or SBI) that fails blocks here - it is NOT caught
-					// and silently worked around; it propagates up to the caller as-is so the
-					// operator sees the specific error and is prompted to re-capture.
-					BiometricQualityOrchestrator.OrchestrationResult orchestrationResult =
-							biometricQualityOrchestrator.orchestrate(biometricsDto);
-					// Only surface the aggregate when a strategy was explicitly configured;
-					// otherwise leave it unset so the UI falls back to the raw SDK score.
-					if (orchestrationResult.isAggregationExplicitlyConfigured()) {
-						biometricsDto.setAggregatedScore(orchestrationResult.getAggregatedScore());
-					}
-					Double sdkOnlyScore = orchestrationResult.getEvaluatorScores().get("SDK");
-					if (sdkOnlyScore != null) {
-						biometricsDto.setSdkScore(sdkOnlyScore);
-					}
-
-					// Enforce re-capture when the score that will actually be shown/used
-					// (aggregate, else SDK, else raw SBI) falls below the existing threshold.
-					double displayScore = getDisplayScore(biometricsDto);
-					double threshold = getMDMQualityThreshold(Modality.getModality(biometricsDto.getBioAttribute()));
-					// Configuration Error: a non-positive threshold means the config key is
-					// missing or invalid, not that "anything passes" - block and flag it
-					// rather than silently letting every capture through.
-					if (threshold <= 0) {
-						LOGGER.error("BioServiceImpl: Invalid/missing quality threshold ({}) for attribute {}",
-								threshold, biometricsDto.getBioAttribute());
-						throw new RegBaseCheckedException(
-								RegistrationExceptionConstants.REG_QUALITY_CONFIG_ERROR.getErrorCode(),
-								RegistrationExceptionConstants.REG_QUALITY_CONFIG_ERROR.getErrorMessage());
-					}
-					if (displayScore < threshold) {
-						// Below-threshold does NOT abort the capture outright - the operator is
-						// still prompted to re-capture (via the existing per-attempt retry UI,
-						// which now shows this attempt's real score instead of losing it), and
-						// once retries are exhausted the best-scoring attempt is force-accepted
-						// (RegistrationDTO#addAllBiometrics). Hard-blocking here with an
-						// exception would discard the score entirely instead of recording it
-						// and letting that mechanism run.
-						LOGGER.info("BioServiceImpl: Quality score {} below threshold {} for attribute {} - recorded, re-capture will be prompted",
-								displayScore, threshold, biometricsDto.getBioAttribute());
+					try {
+						// Route through the BiometricQualityOrchestrator for multi-source evaluation
+						double orchestratedScore = biometricQualityOrchestrator.orchestrate(biometricsDto);
+						biometricsDto.setSdkScore(orchestratedScore);
+					} catch (RegBaseCheckedException orchestratorEx) {
+						// Fallback to direct SDK score if orchestrator is not configured
+						try {
+							LOGGER.warn("BiometricQualityOrchestrator failed, falling back to direct SDK score: {}", orchestratorEx.getMessage());
+							biometricsDto.setSdkScore(getSDKScore(biometricsDto));
+						} catch (BiometricException fallbackEx) {
+							LOGGER.error("Unable to fetch SDK Score ", fallbackEx);
+							throw new RegBaseCheckedException(RegistrationExceptionConstants.REG_BIOMETRIC_QUALITY_CHECK_ERROR.getErrorCode(),
+									RegistrationExceptionConstants.REG_BIOMETRIC_QUALITY_CHECK_ERROR.getErrorMessage());
+						}
 					}
 				}
 				list.add(biometricsDto);
-			}
-
-			// Partial Capture: the device returned fewer biometric segments than this
-			// request required (mdmRequestDto.getCount() is the expected number, minus
-			// any attributes explicitly marked as exceptions).
-			if (list.size() < mdmRequestDto.getCount()) {
-				LOGGER.error("BioServiceImpl: Partial capture for modality {} - expected {} got {}",
-						mdmRequestDto.getModality(), mdmRequestDto.getCount(), list.size());
-				throw new RegBaseCheckedException(
-						RegistrationExceptionConstants.REG_PARTIAL_CAPTURE.getErrorCode(),
-						RegistrationExceptionConstants.REG_PARTIAL_CAPTURE.getErrorMessage());
 			}
 		} catch (RegBaseCheckedException e) {
 			throw e;
@@ -252,7 +205,7 @@ public class BioServiceImpl extends BaseService implements BioService {
 						capturedContext.put(attribute, true);
 						continue;
 					}
-					quality = quality + getDisplayScore(biometricsDto);
+					quality = quality + biometricsDto.getQualityScore();
 					capturedAttributes.add(attribute);
 				}
 				//if some attributes are captured, determine capture status based on threshold check
@@ -303,15 +256,6 @@ public class BioServiceImpl extends BaseService implements BioService {
 		return groupedAttributes;
 	}
 
-	/**
-	 * The score actually shown on the UI's threshold bar: aggregate if the
-	 * aggregation strategy was explicitly configured, else SDK, else raw SBI.
-	 */
-	private static double getDisplayScore(BiometricsDto biometricsDto) {
-		return biometricsDto.getAggregatedScore() > 0 ? biometricsDto.getAggregatedScore()
-				: biometricsDto.getSdkScore() > 0 ? biometricsDto.getSdkScore()
-				: biometricsDto.getQualityScore();
-	}
 
 	@Override
 	public double getMDMQualityThreshold(@NonNull Modality modality) {
